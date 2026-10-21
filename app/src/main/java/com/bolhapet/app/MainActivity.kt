@@ -1,6 +1,15 @@
 package com.bolhapet.app
 
 import android.content.Intent
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Context
+import android.widget.LinearLayout
+import android.widget.TextView
+import android.widget.Button
+import android.widget.ScrollView
+import android.util.Log
+import android.webkit.RenderProcessGoneDetail
 import android.os.Bundle
 import android.webkit.JavascriptInterface
 import android.webkit.WebChromeClient
@@ -35,6 +44,8 @@ class MainActivity : AppCompatActivity() {
     private var initializing: Job? = null
     private var generating: Job? = null
     private var pageLoaded = false
+    private var webDestroyed = false
+    private val logTag = "BolhaPet"
 
     private val chooseGGUF = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         if (uri != null) installModel { progress -> model.import(uri, progress) }
@@ -43,6 +54,20 @@ class MainActivity : AppCompatActivity() {
     @Suppress("DEPRECATION")
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        val previousCrash = CrashReporter.read(this)
+        if (previousCrash != null) {
+            showDiagnostic(previousCrash)
+            return
+        }
+        try {
+            createPetScreen()
+        } catch (error: Throwable) {
+            CrashReporter.record(this, error)
+            showDiagnostic(CrashReporter.read(this) ?: error.toString())
+        }
+    }
+
+    private fun createPetScreen() {
         window.statusBarColor = android.graphics.Color.rgb(255, 240, 245)
         window.navigationBarColor = android.graphics.Color.WHITE
         window.decorView.systemUiVisibility = android.view.View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR or
@@ -63,6 +88,21 @@ class MainActivity : AppCompatActivity() {
             addJavascriptInterface(PetBridge(), "PetNative")
             webChromeClient = WebChromeClient()
             webViewClient = object : WebViewClient() {
+                override fun onRenderProcessGone(view: WebView?, detail: RenderProcessGoneDetail?): Boolean {
+                    val reason = "A WebView parou (renderer crashed=${detail?.didCrash()}). " +
+                        "Verifique se Android System WebView e Chrome estão atualizados."
+                    Log.e(logTag, reason)
+                    CrashReporter.record(this@MainActivity, IllegalStateException(reason))
+                    runOnUiThread {
+                        pageLoaded = false
+                        if (::web.isInitialized && !webDestroyed) {
+                            webDestroyed = true
+                            web.destroy()
+                        }
+                        showDiagnostic(CrashReporter.read(this@MainActivity) ?: reason)
+                    }
+                    return true
+                }
                 override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean {
                     return request?.url?.toString() != "file:///android_asset/pet.html"
                 }
@@ -83,11 +123,60 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    /** Displays the previous launch failure WITHOUT creating another WebView. */
+    private fun showDiagnostic(report: String) {
+        val dp = resources.displayMetrics.density
+        val container = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding((22 * dp).toInt(), (28 * dp).toInt(), (22 * dp).toInt(), (20 * dp).toInt())
+            setBackgroundColor(0xFFFFF7FC.toInt())
+        }
+        container.addView(TextView(this).apply {
+            text = "A Bolha encontrou um problema ao abrir"
+            textSize = 21f
+            setTextColor(0xFF433259.toInt())
+        })
+        container.addView(TextView(this).apply {
+            text = "Toque em Copiar diagnóstico e envie a mensagem aqui. Não desinstale o aplicativo: seus dados ficam preservados."
+            textSize = 14f
+            setPadding(0, (12 * dp).toInt(), 0, (12 * dp).toInt())
+        })
+        container.addView(Button(this).apply {
+            text = "Copiar diagnóstico"
+            setOnClickListener {
+                val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                clipboard.setPrimaryClip(ClipData.newPlainText("Erro Bolha Pet", report))
+                android.widget.Toast.makeText(this@MainActivity, "Diagnóstico copiado", android.widget.Toast.LENGTH_SHORT).show()
+            }
+        })
+        container.addView(Button(this).apply {
+            text = "Tentar abrir novamente"
+            setOnClickListener { CrashReporter.clear(this@MainActivity); recreate() }
+        })
+        container.addView(TextView(this).apply {
+            text = report
+            typeface = android.graphics.Typeface.MONOSPACE
+            textSize = 11f
+            setTextIsSelectable(true)
+            setPadding(0, (12 * dp).toInt(), 0, 0)
+        })
+        setContentView(ScrollView(this).apply { addView(container) })
+    }
+
     private inner class PetBridge {
         @JavascriptInterface fun ready() = runOnUiThread { initializeModelIfPresent() }
         @JavascriptInterface fun send(text: String) = runOnUiThread { askPet(text) }
         @JavascriptInterface fun downloadModel() = runOnUiThread {
             installModel { progress -> model.download(progress) }
+        }
+        @JavascriptInterface fun selectModel(id: String) = runOnUiThread {
+            if (engineReady || downloading?.isActive == true || initializing?.isActive == true) {
+                sendEvent("error", JSONObject().put("text", "Aguarde o modelo atual terminar de carregar."))
+            } else {
+                val selection = runCatching { model.select(id) }
+                selection.onSuccess { initializeModelIfPresent() }
+                    .onFailure { sendEvent("error", JSONObject().put("text", "Modelo inválido")) }
+            }
         }
         @JavascriptInterface fun importModel() = runOnUiThread {
             if (downloading?.isActive != true) chooseGGUF.launch(arrayOf("*/*"))
@@ -111,6 +200,7 @@ class MainActivity : AppCompatActivity() {
         sendEvent("model", JSONObject()
             .put("ready", ready)
             .put("title", if (ready) "Qwen instalado" else "Instalar cérebro local")
+            .put("selected", model.selected().id)
             .put("info", info)
             .put("downloading", downloading)
             .put("progress", percent.coerceIn(0, 100)))
@@ -122,7 +212,7 @@ class MainActivity : AppCompatActivity() {
             try {
                 val local = model.verified()
                 if (local == null) {
-                    modelState(false, "Qwen2.5 3B · Q4_K_M (2,1 GB). Baixe uma única vez ou importe um GGUF já existente.")
+                    modelState(false, "${model.selected().label} · ${(model.selected().size / 1_000_000)} MB. Baixe ou importe um GGUF oficial.")
                     status("Pronta para receber meu cérebro Qwen 💜")
                 } else loadEngine(local)
             } catch (e: CancellationException) {
@@ -160,7 +250,7 @@ class MainActivity : AppCompatActivity() {
 
     private suspend fun loadEngine(file: File) {
         if (engineReady) return
-        status("Preparando Qwen2.5 3B no celular...", "busy")
+        status("Preparando ${model.selected().label} no celular...", "busy")
         modelState(false, "Carregando os pesos em memória; pode levar um pouco...", downloading = true)
         val inference = engine ?: AiChat.getInferenceEngine(applicationContext).also { engine = it }
         val state = withTimeout(65_000) {
@@ -180,7 +270,7 @@ class MainActivity : AppCompatActivity() {
         }
         inference.setTemperature(0.65f)
         engineReady = true
-        modelState(true, "Qwen2.5 3B Q4_K_M instalado e funcionando offline")
+        modelState(true, "${model.selected().label} instalado e funcionando offline")
         status("Bolha pronta para conversar", "ready")
     }
 
@@ -240,8 +330,11 @@ class MainActivity : AppCompatActivity() {
         downloading?.cancel()
         generating?.cancel()
         pageLoaded = false
-        web.removeJavascriptInterface("PetNative")
-        web.destroy()
+        if (::web.isInitialized && !webDestroyed) {
+            webDestroyed = true
+            web.removeJavascriptInterface("PetNative")
+            web.destroy()
+        }
         super.onDestroy()
     }
 
