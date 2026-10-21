@@ -1,0 +1,13 @@
+.gradle/
+.idea/
+build/
+**/build/
+local.properties
+.cxx/
+**/.cxx/
+.cache/
+lib/
+third_party/
+.gradle.kts/
+*.iml
+.DS_Store

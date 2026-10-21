@@ -1,0 +1,50 @@
+name: Compilar Bolha Pet Android
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  android:
+    runs-on: ubuntu-latest
+    timeout-minutes: 95
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      # Reuse the native llama.cpp JNI runtime built for the user's previous Android app.
+      # Pinned commits, no dependency on the old app's screens or APK.
+      - uses: actions/checkout@v4
+        with:
+          repository: danalphbet-prog/eduagent-android
+          ref: 8bcc07e8c9670daa8f055afbddadb773d98ea8a1
+          path: runtime-upstream
+      - uses: actions/checkout@v4
+        with:
+          repository: ggml-org/llama.cpp
+          ref: f174553e1621c6a22a64e7bfcbb58d3a5c49e6fb
+          path: third_party/llama.cpp
+          submodules: recursive
+      - name: Prepare the stable native runtime and Gradle wrapper
+        run: |
+          cp -a runtime-upstream/lib ./lib
+          cp -a runtime-upstream/gradle/wrapper ./gradle/wrapper
+          cp runtime-upstream/gradlew ./gradlew
+          chmod +x gradlew
+          test -f lib/src/main/cpp/CMakeLists.txt
+          test -f gradle/wrapper/gradle-wrapper.jar
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: android-actions/setup-android@v4
+      - name: Install Android SDK, NDK and CMake
+        run: |
+          sdkmanager --install "platforms;android-36" "build-tools;36.0.0" "ndk;29.0.13113456" "cmake;3.31.6"
+      - name: Compile and unit-test the app
+        run: ./gradlew :app:testDebugUnitTest :app:assembleDebug --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bolha-pet-debug-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
